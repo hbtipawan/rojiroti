@@ -893,8 +893,26 @@ else:
             _rot = build_rotation_view(_hist, top_n=12)
             if not _rot.empty:
                 st.markdown("##### Sector × Week — stocks passing G5 ∧ G6 ∧ G7")
-                st.dataframe(_rot.style.background_gradient(axis=None, cmap="Greens"),
-                             use_container_width=True)
+
+                # matplotlib-free green heat shading (background_gradient needs
+                # matplotlib, which crashed every tab on Streamlit Cloud)
+                _vmax = max(float(_rot.values.max()), 1.0)
+                def _green_heat(v):
+                    try:
+                        frac = min(float(v) / _vmax, 1.0)
+                    except (TypeError, ValueError):
+                        return ""
+                    if frac <= 0:
+                        return ""
+                    alpha = 0.15 + 0.75 * frac
+                    txt = "#ffffff" if frac > 0.45 else "#d8ffef"
+                    return (f"background-color: rgba(0, 184, 148, {alpha:.2f}); "
+                            f"color: {txt}; font-weight: 600;")
+                _styler = _rot.style
+                # pandas ≥2.1 renamed Styler.applymap → Styler.map
+                _styler = (_styler.map(_green_heat) if hasattr(_styler, "map")
+                           else _styler.applymap(_green_heat))
+                st.dataframe(_styler, use_container_width=True)
                 if _rot.shape[1] >= 2:
                     _delta = (_rot.iloc[:, -1] - _rot.iloc[:, -2]).sort_values(ascending=False)
                     cR1, cR2 = st.columns(2)

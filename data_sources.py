@@ -65,8 +65,8 @@ _UPSTOX_LIMITER = _RateLimiter(0.06)
 # SHARED WEEKLY-DF CLEANUP — mirrors vpci_engine.fetch_weekly_data's
 # post-processing exactly (drop incomplete week, positive rows, MIN_BARS).
 # ═══════════════════════════════════════════════════════════════════════
-def _clean_weekly(df: pd.DataFrame | None) -> pd.DataFrame | None:
-    if df is None or df.empty or len(df) < MIN_BARS:
+def _clean_weekly(df: pd.DataFrame | None, min_bars: int = MIN_BARS) -> pd.DataFrame | None:
+    if df is None or df.empty or len(df) < min_bars:
         return None
     df = df.copy()
     df.columns = [str(c).strip().capitalize() for c in df.columns]
@@ -80,7 +80,7 @@ def _clean_weekly(df: pd.DataFrame | None) -> pd.DataFrame | None:
         if prev_vol > 0 and last_vol < (prev_vol * 0.25):
             df = df.iloc[:-1]
     df = df[(df["Close"] > 0) & (df["Volume"] > 0)].dropna(subset=["Close", "Volume"])
-    return df if len(df) >= MIN_BARS else None
+    return df if len(df) >= min_bars else None
 
 
 def _daily_to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
@@ -155,7 +155,7 @@ def _upstox_candles(instrument_key: str) -> pd.DataFrame | None:
         return None
 
 
-def fetch_upstox_weekly(symbol: str) -> tuple[pd.DataFrame | None, str]:
+def fetch_upstox_weekly(symbol: str, min_bars: int = MIN_BARS) -> tuple[pd.DataFrame | None, str]:
     """Try NSE then BSE on Upstox. Returns (df, exchange_used)."""
     instruments = load_upstox_instruments()
     sym = symbol.strip().upper()
@@ -163,7 +163,7 @@ def fetch_upstox_weekly(symbol: str) -> tuple[pd.DataFrame | None, str]:
         ikey = instruments.get(exch, {}).get(sym)
         if not ikey:
             continue
-        df = _clean_weekly(_upstox_candles(ikey))
+        df = _clean_weekly(_upstox_candles(ikey), min_bars)
         if df is not None:
             return df, exch
     return None, ""
@@ -350,7 +350,7 @@ def _kite_daily(instrument_token: int) -> pd.DataFrame | None:
         return None
 
 
-def fetch_kite_weekly(symbol: str) -> tuple[pd.DataFrame | None, str]:
+def fetch_kite_weekly(symbol: str, min_bars: int = MIN_BARS) -> tuple[pd.DataFrame | None, str]:
     """Try NSE then BSE on Kite. Daily candles resampled to weekly."""
     token = kite_access_token()
     if not token:
@@ -364,7 +364,7 @@ def fetch_kite_weekly(symbol: str) -> tuple[pd.DataFrame | None, str]:
         daily = _kite_daily(itok)
         if daily is None or daily.empty:
             continue
-        df = _clean_weekly(_daily_to_weekly(daily))
+        df = _clean_weekly(_daily_to_weekly(daily), min_bars)
         if df is not None:
             return df, exch
     return None, ""
@@ -373,7 +373,7 @@ def fetch_kite_weekly(symbol: str) -> tuple[pd.DataFrame | None, str]:
 # ═══════════════════════════════════════════════════════════════════════
 # 3. YAHOO  (fallback — .NS then .BO)
 # ═══════════════════════════════════════════════════════════════════════
-def fetch_yahoo_weekly(symbol: str) -> tuple[pd.DataFrame | None, str]:
+def fetch_yahoo_weekly(symbol: str, min_bars: int = MIN_BARS) -> tuple[pd.DataFrame | None, str]:
     import yfinance as yf
     sym = symbol.strip().upper()
     for suffix, exch in ((".NS", "NSE"), (".BO", "BSE")):
@@ -381,7 +381,7 @@ def fetch_yahoo_weekly(symbol: str) -> tuple[pd.DataFrame | None, str]:
             df = yf.Ticker(sym + suffix).history(period="2y", interval="1wk")
         except Exception:
             df = None
-        df = _clean_weekly(df)
+        df = _clean_weekly(df, min_bars)
         if df is not None:
             return df, exch
     return None, ""
@@ -397,7 +397,8 @@ SOURCE_FETCHERS = {
 }
 
 
-def fetch_weekly_any(symbol: str, source_order: list[str]
+def fetch_weekly_any(symbol: str, source_order: list[str],
+                     min_bars: int = MIN_BARS
                      ) -> tuple[pd.DataFrame | None, str, str]:
     """
     Fetch weekly OHLCV for one symbol, trying each source in order and,
@@ -414,7 +415,7 @@ def fetch_weekly_any(symbol: str, source_order: list[str]
         if fetcher is None:
             continue
         try:
-            df, exch = fetcher(symbol)
+            df, exch = fetcher(symbol, min_bars)
         except Exception:
             df, exch = None, ""
         if df is not None:

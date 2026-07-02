@@ -8,11 +8,27 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from vpci_engine import analyze_stock_v3, DEFAULT_PARAMS
+# ── Startup guard: pinpoint exactly what's missing instead of a redacted
+#    ModuleNotFoundError on Streamlit Cloud ──────────────────────────────
+import importlib.util as _ilu, os as _os
+_missing = []
+for _mod in ("pandas", "numpy", "requests", "yfinance", "pyotp"):
+    if _ilu.find_spec(_mod) is None:
+        _missing.append(f"Python package `{_mod}` → add it to requirements.txt")
+for _f in ("vpci_engine.py", "data_sources.py", "sector_history.py", "signal_history.py"):
+    if not _os.path.exists(_f):
+        _missing.append(f"File `{_f}` → upload it to the repo root")
+if _missing:
+    st.error("🚨 **Deployment is incomplete.** Fix the following and reboot the app:\n\n"
+             + "\n".join(f"- {m}" for m in _missing))
+    st.stop()
+
+from vpci_engine import analyze_stock_v3, DEFAULT_PARAMS, MIN_BARS
 from data_sources import (
     fetch_weekly_any, load_upstox_instruments,
     kite_totp_login, kite_access_token, set_kite_manual_token,
 )
+from signal_history import classify_fresh_v2, analyze_young_stock, YOUNG_MIN_BARS
 from sector_history import (
     load_sector_map, attach_sector_columns, build_sector_leadership,
     save_weekly_snapshot, load_history_from_github, build_rotation_view,
@@ -228,14 +244,37 @@ def universe_path():
 # PROCESSING WORKER  — multi-source chain, screening logic untouched
 # ═══════════════════════════════════════════════════════════════════════════════
 def process_symbol(symbol, params, source_order):
-    df, source, exchange = fetch_weekly_any(symbol, source_order)
+    """
+    Returns ("full", result) | ("young", result) | ("failed", None).
+    Fetches once with the LOW bar minimum so recently listed stocks are kept
+    for the New Listings tab instead of being discarded.
+    """
+    df, source, exchange = fetch_weekly_any(symbol, source_order, min_bars=YOUNG_MIN_BARS)
     if df is None:
-        return None
-    r = analyze_stock_v3(symbol, df, params)
-    if r:
+        return "failed", None
+
+    if len(df) >= MIN_BARS:
+        r = analyze_stock_v3(symbol, df, params)          # engine — untouched
+        if not r:
+            return "failed", None
         r["source"] = source
         r["exchange"] = exchange
-    return r
+        # True fresh classification: position state machine over full history
+        fv = classify_fresh_v2(df, params)
+        r["fresh_v2"] = fv["fresh_v2"]
+        r["fresh_ext_v2"] = fv["fresh_ext_v2"]
+        r["in_open_position"] = fv["in_open_position"]
+        r["position_state"] = fv["position_state"]
+        r["last_entry_date"] = fv["last_entry_date"]
+        r["last_exit_date"] = fv["last_exit_date"]
+        return "full", r
+
+    y = analyze_young_stock(symbol, df, params)
+    if y:
+        y["source"] = source
+        y["exchange"] = exchange
+        return "young", y
+    return "failed", None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -362,6 +401,7 @@ if run_scan:
 
     progress_bar = st.progress(len(done_symbols) / max(len(symbols), 1))
     status_text = st.empty()
+    young_results = list(st.session_state.get("young_results_partial", []))
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(process_symbol, s, params, source_order): s for s in remaining}
@@ -374,9 +414,11 @@ if run_scan:
             progress_bar.progress(done / max(len(symbols), 1))
             status_text.text(f"Scanning... {done} / {len(symbols)} processed")
             try:
-                r = f.result()
-                if r:
+                kind, r = f.result()
+                if kind == "full" and r:
                     results.append(r)
+                elif kind == "young" and r:
+                    young_results.append(r)
                 else:
                     failed.append(sym)
             except Exception:
@@ -399,8 +441,10 @@ if run_scan:
         df = pd.DataFrame(results)
 
         def status_label(row):
-            if row.get("fresh_signal"): return "🔥 FRESH BUY"
-            if row.get("fresh_ext_signal"): return "🔥 FRESH EXT"
+            # v2 fresh: entry with NO open prior position (first-ever, or after a sell)
+            if row.get("fresh_v2"): return "🔥 FRESH BUY"
+            if row.get("fresh_ext_v2"): return "🔥 FRESH EXT"
+            if row.get("full_entry") and row.get("in_open_position"): return "📌 CONTINUING (7/7)"
             if row.get("full_entry"): return "★ BUYABLE (7/7)"
             if row.get("gates_ready_ext"): return "⚡ 7/7 EXTENDED"
             if row.get("relaxed_entry"): return "★ RELAXED (6/7)"
@@ -458,6 +502,8 @@ if run_scan:
 
         # ── Persist everything the UI needs ──────────────────────────────
         st.session_state["scan_df"] = df_sorted
+        st.session_state["young_df"] = (pd.DataFrame(young_results)
+                                        if young_results else pd.DataFrame())
         st.session_state["scan_failed"] = failed
         st.session_state["scan_time"] = datetime.now().isoformat(timespec="seconds")
 
@@ -544,21 +590,39 @@ else:
         return out
 
     # ─── TABS ───
-    tab1, tab2, tab3, tab4, tab5, tab6, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "🔥 Fresh Signals", "★ Buyable (7/7)", "◉ Watchlist (6/7)",
-        "All Results", "🏆 Ranked", "🎯 G4 Pending",
+        "All Results", "🏆 Ranked", "🎯 G4 Pending", "🌱 New Listings",
         "🏭 Sector Leadership", "📈 Sector Rotation"
     ])
 
     with tab1:
+        st.caption(
+            "**Fresh = a genuinely NEW entry.** All 7 gates open this week AND the stock has "
+            "no open prior position — either it never signalled before, or its last position "
+            "was closed by a SELL (weekly close below the 3×ATR trailing stop). Stocks that "
+            "merely re-passed 7/7 while an old buy is still live are excluded (they show as "
+            "📌 CONTINUING in All Results). `position_state` tells you which case each one is."
+        )
         fresh_df = df_ui[df_ui["status"].isin(["🔥 FRESH BUY", "🔥 FRESH EXT"])]
         if not fresh_df.empty:
+            _lead_cols = ["symbol", "Company Name", "Market Cap", "close", "status",
+                          "position_state", "last_exit_date", "vpci", "rs_return",
+                          "pct_from_52w", "trail_stop", "init_sl", "risk_pct",
+                          "vol_ratio", "scenario", "source", "exchange"]
+            _rest = [c for c in fresh_df.columns if c not in _lead_cols]
+            fresh_df = fresh_df[[c for c in _lead_cols if c in fresh_df.columns] + _rest]
             st.dataframe(fresh_df, use_container_width=True, column_config=tv_config, hide_index=True)
         else:
-            st.info("No fresh breakout signals detected this week.")
+            st.info("No genuinely fresh signals this week (first-ever, or first after a sell).")
+        _cont = df_ui[df_ui["status"] == "📌 CONTINUING (7/7)"]
+        if not _cont.empty:
+            with st.expander(f"📌 {len(_cont)} stocks re-showing 7/7 inside an OPEN position "
+                             f"(old engine wrongly called these fresh)"):
+                st.dataframe(_cont, use_container_width=True, column_config=tv_config, hide_index=True)
 
     with tab2:
-        buyable_df = df_ui[df_ui["status"] == "★ BUYABLE (7/7)"]
+        buyable_df = df_ui[df_ui["status"].isin(["★ BUYABLE (7/7)", "📌 CONTINUING (7/7)"])]
         if not buyable_df.empty:
             st.dataframe(buyable_df, use_container_width=True, column_config=tv_config, hide_index=True)
         else:
@@ -652,6 +716,53 @@ else:
         else:
             st.warning("No stocks meet the strict G4-pending criteria this week "
                        "(all 6 other gates passing, only G4 missing).")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 🌱 New Listings — too young for the 7-gate scan, VPCI accumulation view
+    # ═══════════════════════════════════════════════════════════════════
+    with tab7:
+        st.subheader("🌱 New Listings — Early VPCI Accumulation Watch")
+        st.caption(
+            f"Stocks with {YOUNG_MIN_BARS}–{MIN_BARS - 1} weekly bars — too young for the "
+            f"full 7-gate scan (needs the 40-week SMA), but old enough for the exact same "
+            f"VPCI 5/20 computation. **Accumulating = the engine's G5 condition** "
+            f"(VPCI > 0, above its signal line, and rising). These are candidates to track "
+            f"until they mature into the main scan — not buy signals."
+        )
+        young_df = st.session_state.get("young_df", pd.DataFrame())
+        if young_df is None or young_df.empty:
+            st.info("No recently listed stocks with enough bars for a VPCI read were found this scan.")
+        else:
+            yd = young_df.copy().sort_values(
+                ["accumulating", "vpci"], ascending=[False, False]).reset_index(drop=True)
+            yc1, yc2, yc3 = st.columns(3)
+            yc1.metric("🌱 Young stocks scanned", len(yd))
+            yc2.metric("✅ Accumulating (G5-style)", int(yd["accumulating"].sum()))
+            yc3.metric("📈 Above 13w EMA", int(yd["above_13ema"].sum()))
+            st.divider()
+
+            yd_ui = add_tv(yd)
+            _acc = yd_ui[yd_ui["accumulating"] == True]
+            st.markdown("##### ✅ Accumulating — VPCI > 0, above signal, rising")
+            if not _acc.empty:
+                st.dataframe(
+                    _acc.style.format({"close": "{:.2f}", "vpci": "{:.4f}",
+                                       "vpci_signal": "{:.4f}", "vol_ratio": "{:.2f}"}),
+                    use_container_width=True, column_config=tv_config, hide_index=True)
+            else:
+                st.info("None of the young listings show VPCI accumulation this week.")
+
+            with st.expander("All young listings (including non-accumulating)"):
+                st.dataframe(
+                    yd_ui.style.format({"close": "{:.2f}", "vpci": "{:.4f}",
+                                        "vpci_signal": "{:.4f}", "vol_ratio": "{:.2f}"}),
+                    use_container_width=True, column_config=tv_config, hide_index=True)
+
+            st.download_button(
+                "📥 Download New Listings CSV",
+                data=yd.to_csv(index=False).encode("utf-8"),
+                file_name=f"vpci_new_listings_{datetime.now():%Y%m%d_%H%M}.csv",
+                mime="text/csv", key="young_download")
 
     # ═══════════════════════════════════════════════════════════════════
     # Sector & Industry Leadership (G5 + G6 + G7)

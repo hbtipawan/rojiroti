@@ -81,3 +81,39 @@ folder = "history"
 3. Add/verify the `[kite]` and `[github]` secrets.
 4. Reboot the app. Run a scan → check the coverage badges → open Sector
    Leadership and confirm "Snapshot status: ✅ …pushed to …".
+
+---
+
+## Update 2 — Crash fix, True Fresh Signals, New Listings tab
+
+### The ModuleNotFoundError on Streamlit Cloud
+The traceback dies at `from vpci_engine import …`, which means one of two
+things in your `rojiroti` repo: **(a)** `vpci_engine.py` isn't in the repo
+root, or **(b)** it is, but `yfinance` is missing from `requirements.txt`
+(vpci_engine imports yfinance at the top, so the error surfaces on that line).
+Checklist — repo root must contain: `app.py`, `vpci_engine.py`,
+`data_sources.py`, `sector_history.py`, `signal_history.py`,
+`Stock_List.csv`, and `requirements.txt` with all five packages
+(streamlit, pandas, requests, yfinance, pyotp). The app now has a **startup
+guard** that names the exact missing file/package on screen instead of the
+redacted crash. Reboot the app after pushing.
+
+### True Fresh Signals (fresh_v2)
+Old behaviour: "fresh" = 7/7 now but not on the previous bar — so a stock
+already in an open position that dipped to 6/7 for a week and re-passed
+showed as fresh. New behaviour: the full weekly history is replayed as a
+position state machine — ENTRY on 7/7 (same gates + extension filter, using
+the engine's own `_check_gates_at`), trailing stop ratchets at close − 3×ATR,
+SELL when close breaks it. **FRESH = 7/7 fires with no open prior position**
+(first-ever signal, or first after a sell). Re-triggers inside a live
+position are labelled 📌 CONTINUING (7/7) — still in the Buyable tab, with an
+audit expander in the Fresh tab. `position_state`, `last_entry_date`,
+`last_exit_date` columns show the reasoning for every stock.
+
+### 🌱 New Listings tab
+Stocks with 22–41 weekly bars (too young for the 40-week SMA gate) used to
+fall into "failed". They're now kept and given the engine's exact VPCI 5/20
+computation. Those meeting the G5 condition (VPCI > 0, above signal, rising)
+are flagged **Accumulating** — a watch list of promising young listings to
+track until they mature into the main scan. Full 7-gate logic is completely
+unchanged; this is a separate additive view.

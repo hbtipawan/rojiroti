@@ -243,15 +243,30 @@ def universe_path():
 # ═══════════════════════════════════════════════════════════════════════════════
 # PROCESSING WORKER  — multi-source chain, screening logic untouched
 # ═══════════════════════════════════════════════════════════════════════════════
-def process_symbol(symbol, params, source_order):
+def process_symbol(symbol, params, source_order, live=False, project_volume=True):
     """
     Returns ("full", result) | ("young", result) | ("failed", None).
     Fetches once with the LOW bar minimum so recently listed stocks are kept
     for the New Listings tab instead of being discarded.
+
+    live=True → last weekly bar is the CURRENT, still-forming week.
     """
-    df, source, exchange = fetch_weekly_any(symbol, source_order, min_bars=YOUNG_MIN_BARS)
+    df, source, exchange = fetch_weekly_any(symbol, source_order,
+                                            min_bars=YOUNG_MIN_BARS,
+                                            live=live, project_volume=project_volume)
     if df is None:
         return "failed", None
+
+    _meta = {
+        "live_mode":        bool(live),
+        "partial_week":     bool(df.attrs.get("partial_week", False)),
+        "elapsed_sessions": df.attrs.get("elapsed_sessions"),
+        "week_confidence":  df.attrs.get("week_confidence"),
+        "volume_projected": bool(df.attrs.get("volume_projected", False)),
+        "projection_mult":  df.attrs.get("projection_mult"),
+        "asof":             df.attrs.get("asof"),
+        "week_ending":      str(df.index[-1].date()),
+    }
 
     if len(df) >= MIN_BARS:
         r = analyze_stock_v3(symbol, df, params)          # engine — untouched
@@ -267,12 +282,14 @@ def process_symbol(symbol, params, source_order):
         r["position_state"] = fv["position_state"]
         r["last_entry_date"] = fv["last_entry_date"]
         r["last_exit_date"] = fv["last_exit_date"]
+        r.update(_meta)
         return "full", r
 
     y = analyze_young_stock(symbol, df, params)
     if y:
         y["source"] = source
         y["exchange"] = exchange
+        y.update(_meta)
         return "young", y
     return "failed", None
 
@@ -321,6 +338,36 @@ with st.sidebar.expander("🔑 Kite Connect — Daily Login", expanded=False):
             set_kite_manual_token(_manual)
             st.success("Manual token saved for today.")
             st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🔴 Live / Intraweek Mode")
+from data_sources import market_is_open, ist_now, session_fraction
+
+_open = market_is_open()
+st.sidebar.caption(
+    f"🕒 {ist_now().strftime('%a %d %b, %H:%M')} IST — "
+    + ("🟢 **Market OPEN** " + f"({session_fraction()*100:.0f}% of session done)"
+       if _open else "🔴 Market closed")
+)
+live_mode = st.sidebar.toggle(
+    "Screen the RUNNING week (live candle)", value=_open,
+    help="OFF = only completed weekly candles (Friday closes).\n"
+         "ON  = the current, still-forming week is used as the latest bar, "
+         "built from daily candles + today's live intraday candle."
+)
+project_volume = st.sidebar.toggle(
+    "Pro-rate partial-week volume", value=True, disabled=not live_mode,
+    help="A part-week has part-week volume, which artificially crushes VPCI's "
+         "volume terms (VM, VPR) early in the week. This scales the running "
+         f"week's volume to a full-week equivalent (capped at 5x, skipped if "
+         f"less than half a session has elapsed). It is an ASSUMPTION — it can "
+         "flip gates. Turn off to see raw, un-extrapolated volume."
+)
+if live_mode:
+    st.sidebar.warning(
+        "⚠️ Signals on the running week are **provisional** — they can and do "
+        "flip before Friday's close. Weigh them by the `week_confidence` column."
+    )
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎯 Algorithm Settings")
@@ -404,7 +451,8 @@ if run_scan:
     young_results = list(st.session_state.get("young_results_partial", []))
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(process_symbol, s, params, source_order): s for s in remaining}
+        futs = {ex.submit(process_symbol, s, params, source_order,
+                          live_mode, project_volume): s for s in remaining}
         done = len(done_symbols)
         since_ckpt = 0
         for f in as_completed(futs):

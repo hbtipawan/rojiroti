@@ -111,8 +111,35 @@ class _RateLimiter:
             self._last = time.monotonic()
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# FETCH DIAGNOSTICS — every failure is recorded with a reason, so a symbol
+# can never vanish from a scan silently. Read with get_diag() after a run.
+# ═══════════════════════════════════════════════════════════════════════
+_DIAG: list = []
+_DIAG_LOCK = threading.Lock()
+
+
+def _diag(symbol: str, source: str, reason: str) -> None:
+    with _DIAG_LOCK:
+        _DIAG.append({"symbol": symbol, "source": source, "reason": reason})
+
+
+def get_diag() -> pd.DataFrame:
+    with _DIAG_LOCK:
+        return pd.DataFrame(list(_DIAG))
+
+
+def clear_diag() -> None:
+    with _DIAG_LOCK:
+        _DIAG.clear()
+
+
 _KITE_LIMITER   = _RateLimiter(0.40)   # ~2.5 req/s, safely under Kite's 3/s
 _UPSTOX_LIMITER = _RateLimiter(0.06)
+# Yahoo throttles hard on repeated full-universe scans, and live mode pulls ~5x
+# the payload (2y of DAILY bars, not weekly). Without this, coverage silently
+# collapses mid-scan and you get fewer candidates rather than an error.
+_YAHOO_LIMITER  = _RateLimiter(0.15)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -145,6 +172,10 @@ def _finalise_live(weekly: pd.DataFrame, daily: pd.DataFrame,
     """Tag the frame as partial and (optionally) pro-rate the running week's
     volume up to a full-week equivalent so VPCI's volume terms aren't crushed."""
     weekly = weekly.copy()
+    # Yahoo hands back int64 volume; Upstox/Kite hand back float. Writing a
+    # pro-rated float into an int64 column raises LossySetitemError, which the
+    # caller swallows -> the symbol vanishes from the scan with no error.
+    weekly["Volume"] = weekly["Volume"].astype("float64")
     elapsed = week_elapsed_sessions(daily)
     raw_vol = float(weekly["Volume"].iloc[-1])
     mult = 1.0
@@ -581,22 +612,37 @@ def fetch_yahoo_weekly(symbol: str, min_bars: int = MIN_BARS,
     delayed) instead of using the 1wk interval."""
     import yfinance as yf
     sym = symbol.strip().upper()
+
+    def _hist(ticker: str, interval: str, tries: int = 3):
+        """Rate-limited fetch with exponential backoff. Returns None, never raises."""
+        last = "empty"
+        for attempt in range(tries):
+            _YAHOO_LIMITER.wait()
+            try:
+                d = yf.Ticker(ticker).history(period="2y", interval=interval)
+                if d is not None and not d.empty:
+                    return d
+            except Exception as e:
+                last = f"{type(e).__name__}: {str(e)[:80]}"
+            time.sleep(0.5 * (2 ** attempt))   # 0.5s, 1.0s, 2.0s
+        _diag(symbol, f"Yahoo{ticker[-3:]}", last)
+        return None
+
     for suffix, exch in ((".NS", "NSE"), (".BO", "BSE")):
-        try:
-            daily = None
-            if live:
-                daily = yf.Ticker(sym + suffix).history(period="2y", interval="1d")
-                if daily is None or daily.empty:
-                    continue
-                daily.index = pd.DatetimeIndex(daily.index).tz_localize(None).normalize()
-                df = _clean_weekly(_daily_to_weekly(daily), min_bars, keep_partial=True)
-                if df is not None:
-                    return _finalise_live(df, daily, project_volume), exch
+        if live:
+            daily = _hist(sym + suffix, "1d")
+            if daily is None:
                 continue
-            df = yf.Ticker(sym + suffix).history(period="2y", interval="1wk")
-        except Exception:
-            df = None
-        df = _clean_weekly(df, min_bars)
+            try:
+                daily.index = pd.DatetimeIndex(daily.index).tz_localize(None).normalize()
+            except (TypeError, ValueError):
+                daily.index = pd.DatetimeIndex(daily.index).normalize()
+            df = _clean_weekly(_daily_to_weekly(daily), min_bars, keep_partial=True)
+            if df is not None:
+                return _finalise_live(df, daily, project_volume), exch
+            continue
+
+        df = _clean_weekly(_hist(sym + suffix, "1wk"), min_bars)
         if df is not None:
             return df, exch
     return None, ""
@@ -638,8 +684,12 @@ def fetch_weekly_any(symbol: str, source_order: list[str],
         try:
             df, exch = fetcher(symbol, min_bars, live=live,
                                project_volume=project_volume)
-        except Exception:
+        except Exception as e:
+            # Previously this swallowed real bugs (e.g. an int64 Volume column
+            # rejecting a pro-rated float) and the symbol just disappeared.
+            _diag(symbol, src, f"EXC {type(e).__name__}: {str(e)[:100]}")
             df, exch = None, ""
         if df is not None:
             return df, src, exch
+    _diag(symbol, "ALL", "not found on any source")
     return None, "", ""

@@ -368,6 +368,31 @@ if live_mode:
         "⚠️ Signals on the running week are **provisional** — they can and do "
         "flip before Friday's close. Weigh them by the `week_confidence` column."
     )
+    # Guard 1: live mode on Yahoo alone throttles hard on a full-universe scan.
+    _live_sources = [s for s in source_order if s != "Yahoo"]
+    _kite_live_ok = ("Kite" in source_order) and bool(kite_access_token())
+    if "Upstox" not in source_order and not _kite_live_ok:
+        st.sidebar.error(
+            "🚨 **Live mode will fall through to Yahoo only.** Yahoo throttles on "
+            "full-universe daily scans — coverage silently collapses (you get "
+            "*fewer candidates*, not an error). Add **Upstox** to the source "
+            "order (no API key needed, serves today's intraday candle) or log "
+            "into Kite above."
+        )
+    elif "Kite" in source_order and not kite_access_token():
+        st.sidebar.info(
+            "ℹ️ Kite has no token — it will be skipped. Upstox will serve the "
+            "live candle instead."
+        )
+    # Guard 2: raw partial-week volume crushes VPCI's VM/VPR terms → G5 fails.
+    if not project_volume:
+        st.sidebar.error(
+            "🚨 **Pro-rate is OFF.** The running week holds only "
+            f"~{session_fraction()*100:.0f}% of today plus prior sessions of volume, so "
+            "`VM = SMA_V(5)/SMA_V(20)` and `VPR` collapse, VPCI goes negative, "
+            "**G5 fails and your 7/7 count will crater**. This is arithmetic, "
+            "not signal. Turn it ON unless you are deliberately inspecting raw volume."
+        )
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🎯 Algorithm Settings")
